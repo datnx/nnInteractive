@@ -171,6 +171,7 @@ class nnInteractiveRemoteInferenceSession:
         set_image_read_timeout: float = 600.0,
         write_timeout: float = 120.0,
         pool_timeout: float = 10.0,
+        client_cert = None
     ):
         if api_key is None:
             api_key = os.environ.get("NN_INTERACTIVE_API_KEY")
@@ -188,6 +189,7 @@ class nnInteractiveRemoteInferenceSession:
                 pool=pool_timeout,
             ),
             headers=headers,
+            cert=client_cert
         )
         # Per-request timeout override for set_image: same connect/write/pool as
         # the client default, but a much longer read budget for server-side
