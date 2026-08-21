@@ -20,7 +20,7 @@ import numpy as np
 
 try:
     import torch
-except ImportError:
+except Exception:
     # torch is an optional dependency for the lightweight client role
     # (`pip install nnInteractive[client]`). It is only needed when the caller
     # uses a torch.Tensor target buffer; numpy buffers work without it.
