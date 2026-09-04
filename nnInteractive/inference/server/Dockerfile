@@ -25,11 +25,21 @@ WORKDIR /opt/nninteractive/src
 COPY nnInteractive/inference/server/docker-entrypoint.sh /usr/local/bin/nninteractive-entrypoint
 RUN chmod +x /usr/local/bin/nninteractive-entrypoint
 
-# The full package depends on nninteractive-client (under client/) via an exact
-# pin. Install the bundled client first so the pin resolves from source, not PyPI.
+# The full package depends on nninteractive-client (under client/), pinned by a
+# URL so that a bare `pip install` of just this package resolves the fork's
+# client instead of PyPI (see pyproject.toml). Unlike a plain version pin, a
+# URL pin isn't satisfied by an already-installed local copy, so pip would
+# otherwise re-fetch the client from GitHub here instead of using the source
+# just copied in below. Install the bundled client directly, install the rest
+# of the declared dependencies (read live from pyproject.toml via
+# docker_requirements.py, so nothing is duplicated here), then install the
+# package itself with --no-deps.
 COPY . .
 RUN pip install --no-cache-dir ./client \
-    && pip install --no-cache-dir .
+    && python nnInteractive/inference/server/docker_requirements.py > /tmp/requirements.txt \
+    && pip install --no-cache-dir -r /tmp/requirements.txt \
+    && pip install --no-cache-dir --no-deps . \
+    && rm /tmp/requirements.txt
 
 # Defaults: bind all interfaces (reachable from outside the container). For lite,
 # NNINTERACTIVE_MODEL_DIR is the /model mount; a mounted checkpoint needs
