@@ -14,9 +14,11 @@
 # --- runtime / lite -------------------------------------------------------
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime AS runtime
 
-# g++ for torch.compile's startup warmup; git for any VCS-based pip deps.
+# g++ for torch.compile's startup warmup; git for any VCS-based pip deps;
+# stunnel4 to put TLS with client-certificate checks in front of the server
+# (configured and started at run time, not here).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential git \
+    && apt-get install -y --no-install-recommends build-essential git stunnel4 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1
