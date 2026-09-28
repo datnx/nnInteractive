@@ -82,6 +82,7 @@ from nnInteractive.inference.remote._protocol import (
     PATH_PREDICT,
     PATH_RELEASE,
     PATH_RESET_INTERACTIONS,
+    PATH_SESSIONS,
     PATH_SET_DO_AUTOZOOM,
     PATH_SET_IMAGE,
     PATH_SET_TARGET_BUFFER,
@@ -192,6 +193,9 @@ class SessionRegistry:
         self._enable_undo = bool(enable_undo)
         self._entries: dict[str, SessionEntry] = {}
         self._mu = threading.Lock()
+        # Most recent real user action on any session, including sessions since released
+        # or reaped. Claims don't count, so a claim-and-release health check isn't usage.
+        self._last_activity_at: Optional[float] = None
 
     @property
     def max_sessions(self) -> int:
@@ -237,7 +241,7 @@ class SessionRegistry:
         Note this only refreshes the liveness clock, not activity: a bare
         ``/heartbeat`` keeps the session from being reaped as dead but does not
         postpone the idle timeout. Endpoints that represent real user actions
-        call ``entry.mark_active()`` explicitly (see the lock helpers)."""
+        call ``registry.mark_active(entry)`` explicitly (see the lock helpers)."""
         if not token:
             raise HTTPException(status.HTTP_410_GONE, detail="lease token missing")
         with self._mu:
@@ -309,6 +313,22 @@ class SessionRegistry:
 
     def remaining_seconds(self, entry: SessionEntry) -> float:
         return max(0.0, self._idle_timeout_seconds - (time.monotonic() - entry.last_active_at))
+
+    def mark_active(self, entry: SessionEntry) -> None:
+        """Record real user activity on ``entry`` and on the server as a whole."""
+        entry.mark_active()
+        self._last_activity_at = entry.last_active_at
+
+    def activity(self) -> dict:
+        """Server-wide usage, for deciding whether an idle instance can be shut down."""
+        with self._mu:
+            active_sessions = len(self._entries)
+        last = self._last_activity_at
+        return {
+            "active_sessions": active_sessions,
+            # Seconds rather than a timestamp: the monotonic clock isn't comparable across machines.
+            "idle_seconds": None if last is None else round(time.monotonic() - last, 1),
+        }
 
 
 def make_app(
@@ -517,7 +537,7 @@ def make_app(
 
         Every endpoint routed through here represents a real user action, so we
         also refresh the activity clock (postponing the idle timeout)."""
-        entry.mark_active()
+        registry.mark_active(entry)
         with entry.lock:
             try:
                 return fn(entry.session)
@@ -533,7 +553,7 @@ def make_app(
         is always session-then-gpu to avoid deadlocks.
 
         Like ``_under_session_lock``, this marks real user activity."""
-        entry.mark_active()
+        registry.mark_active(entry)
         with entry.lock:
             try:
                 with gpu_lock:
@@ -593,6 +613,11 @@ def make_app(
             "remaining_seconds": registry.remaining_seconds(entry),
             "idle_timeout_seconds": registry.idle_timeout_seconds,
         }
+
+    @app.get(PATH_SESSIONS, dependencies=[auth])
+    def sessions() -> dict:
+        # Read-only: does NOT touch any session's clocks.
+        return registry.activity()
 
     @app.post(PATH_SET_IMAGE, dependencies=[auth])
     async def set_image(request: Request, entry: SessionEntry = lease) -> dict:
