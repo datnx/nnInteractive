@@ -146,6 +146,7 @@ class nnInteractiveInferenceSession:
         self.channel_mapping: dict = {}
         self.supports_initial_label: bool = True
         self.supports_zero_shot_label_refinement: bool = True
+        self.supports_edit_radius: bool = True
         # License of the loaded model checkpoint. Set when the model is loaded
         # (read from the LICENSE file in the checkpoint folder, or derived for
         # legacy checkpoints without one). Exposed so GUIs can display it once
@@ -1184,7 +1185,14 @@ class nnInteractiveInferenceSession:
         include_interaction: bool,
         run_prediction: bool = True,
         override_capability_checks: bool = False,
+        edit_radius: Optional[Tuple[float, float, float]] = None,
     ) -> Optional[List[List[int]]]:
+        """
+        edit_radius: If edit_radius is set, autozoom is skipped and only the voxels
+        within the ellipsoid can changeThe radius is in voxels per axis, in the same
+        axis order as coordinates. It's only used with run_prediction=True. radii
+        larger than the patch allows are reduced to fit
+        """
         self._check_capability_or_warn("points", override_capability_checks)
         point_pos_channel, point_neg_channel = self._resolve_channel_pair("points", override_capability_checks)
         self._finish_preprocessing_and_initialize_interactions()
@@ -1205,7 +1213,7 @@ class nnInteractiveInferenceSession:
             intensity_scale=self.current_interaction_intensity,
         )
         if run_prediction:
-            return self._predict()
+            return self._predict(edit_radius=edit_radius)
         return None
 
     def _add_image_interaction(
@@ -1408,10 +1416,14 @@ class nnInteractiveInferenceSession:
         print(f"warmup forward pass complete in {time() - start:.1f}s; the first prediction will be fast")
 
     @torch.inference_mode()
-    def _predict(self, force_full_refine: bool = False) -> Optional[List[List[int]]]:
+    def _predict(
+        self, force_full_refine: bool = False, edit_radius: Optional[Tuple[float, float, float]] = None
+    ) -> Optional[List[List[int]]]:
         """
         force_full_refine if True we run the refinement over the whole current prediction and not just the diff map.
         More effort but sometimes needed (refine initial seg)
+
+        edit_radius is used only for point prompt. See add_point_interaction for more details.
 
         If it feels like we are excessively transferring tensors between CPU and GPU, this is deliberate.
         Our goal is to keep this tool usable even for people with smaller GPUs (8-10GB VRAM). In an ideal world
@@ -1462,8 +1474,24 @@ class nnInteractiveInferenceSession:
             pred = self.network(input_for_predict[None].contiguous())[0].argmax(0).detach()
             del input_for_predict
 
-            # detect changes at border. If there are, we enter autozoom
-            has_change = self._detect_change_at_border(pred, previous_prediction)
+            if edit_radius is not None:
+                # cap each radius
+                edit_radius = [min(r, (p - 1) // 2) for r, p in zip(edit_radius, scaled_patch_size)]
+
+                # construct the mask
+                terms = [
+                    ((torch.arange(lo, hi, device=pred.device) - c) / r) ** 2
+                    for (lo, hi), c, r in zip(scaled_bbox, prediction_center, edit_radius)
+                ]
+                inside = (terms[0][:, None, None] + terms[1][None, :, None] + terms[2][None, None, :]) <= 1
+
+                # apply the mask
+                pred = torch.where(inside, pred, previous_prediction.to(pred.dtype))
+                has_change = False
+            else:
+                # detect changes at border. If there are, we enter autozoom
+                has_change = self._detect_change_at_border(pred, previous_prediction)
+
             del previous_prediction
             empty_cache(self.device)
 
