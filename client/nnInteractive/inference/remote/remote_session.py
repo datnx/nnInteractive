@@ -249,6 +249,11 @@ class nnInteractiveRemoteInferenceSession:
         # server was started with --no-undo (undo disabled server-wide).
         self.supports_undo: bool = bool(caps.get("supports_undo", False))
 
+        # Older servers don't have "supports_edit_radius", we set it to False by default
+        # to prevent the client from sending edit_radius to old servers which would silently
+        # do nothing.
+        self.supports_edit_radius: bool = bool(caps.get("supports_edit_radius", False))
+
         self.original_image_shape: Optional[Tuple[int, ...]] = None
         self.target_buffer: Union[np.ndarray, "torch.Tensor", None] = None
         # Bbox (clipped, in target-buffer coordinates) of the region the most recent prediction
@@ -438,6 +443,7 @@ class nnInteractiveRemoteInferenceSession:
         include_interaction: bool,
         run_prediction: bool = True,
         override_capability_checks: bool = False,
+        edit_radius: Optional[Tuple[float, float, float]] = None,
     ) -> Optional[List[List[int]]]:
         resp = self._post_json(
             PATH_ADD_POINT,
@@ -446,6 +452,7 @@ class nnInteractiveRemoteInferenceSession:
                 "include_interaction": bool(include_interaction),
                 "run_prediction": bool(run_prediction),
                 "override_capability_checks": bool(override_capability_checks),
+                "edit_radius": edit_radius,
             },
         )
         self._apply_prediction_response(resp)

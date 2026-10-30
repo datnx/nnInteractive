@@ -720,6 +720,7 @@ def make_app(
                 include_interaction=bool(payload["include_interaction"]),
                 run_prediction=run_prediction,
                 override_capability_checks=bool(payload.get("override_capability_checks", False)),
+                edit_radius=payload.get("edit_radius"),
             )
             return run_prediction
 
@@ -811,4 +812,5 @@ def _build_capability_snapshot(session: nnInteractiveInferenceSession) -> dict:
         "license": session.license,
         # Reflects the server-wide undo policy (--no-undo): whether undo is available on this server.
         "supports_undo": bool(session.supports_undo),
+        "supports_edit_radius": bool(session.supports_edit_radius),
     }
