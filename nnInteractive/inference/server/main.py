@@ -18,7 +18,7 @@ import torch
 import uvicorn
 
 from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
-from nnInteractive.inference.server.app import make_app
+from nnInteractive.inference.server.app import make_app, make_gpu_executor
 
 logger = logging.getLogger("nninteractive.server")
 
@@ -74,7 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["blosc2", "tensor", "auto"],
         default="auto",
         help="Storage backend for the interaction tensor (default: auto). 'blosc2': compact "
-        "in-memory array (low RAM, pays (de)compression per read/write). 'tensor': dense pinned "
+        "in-memory array (low RAM, pays (de)compression per read/write). 'tensor': dense "
         "CPU float16 torch.Tensor (more RAM, lower per-access overhead). 'auto': per image, use "
         "'tensor' for images up to 512x512x1024 voxels and 'blosc2' for larger ones.",
     )
@@ -87,10 +87,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-undo",
         action="store_true",
         help="Disable single-level undo for all sessions server-wide (default: enabled). Undo "
-        "snapshots the interaction tensor and target buffer before each interaction, costing extra "
-        "RAM per session and some background CPU per prediction. Pass this to skip that overhead "
-        "when clients never undo; the /undo endpoint then always reports nothing to undo. Undo is "
-        "a server-startup decision — there is no per-client toggle.",
+        "saves a compressed copy of every region an interaction overwrites (interaction channels and "
+        "target buffer) just before it is written, costing a few ms per prediction and the RAM of those "
+        "compressed regions until the next interaction. Pass this to skip that overhead when clients "
+        "never undo; the /undo endpoint then always reports nothing to undo. Undo is a server-startup "
+        "decision — there is no per-client toggle.",
     )
     p.add_argument(
         "--max-sessions",
@@ -270,6 +271,10 @@ def main(argv=None) -> int:
     loader.executor.shutdown(wait=False)
     del loader
 
+    # Every forward pass (the warmup below and all client predictions) runs on this one thread:
+    # cuDNN's benchmark cache is thread-local, so warming up anywhere else would not help.
+    gpu_executor = make_gpu_executor(device)
+
     if use_torch_compile or device.type == "cuda":
         # Run a single dummy forward pass at startup so the cost of the first pass is
         # paid here rather than on the first client's first prediction.
@@ -280,8 +285,9 @@ def main(argv=None) -> int:
         #   warmed compile cache) instead of re-wrapping the raw module.
         # * Without torch.compile, the dummy pass still warms the CUDA device — cuDNN
         #   selects/autotunes its convolution algorithms and the caching allocator grows
-        #   its memory pool. That state is process/device-global, so warming it via one
-        #   short-lived session benefits every later client session.
+        #   its memory pool. The allocator pool is process-global, but the cuDNN algorithm
+        #   cache is per thread, hence running the warmup on the shared GPU thread; that way
+        #   warming via one short-lived session benefits every later client session.
         if use_torch_compile:
             logger.info("torch.compile enabled; compiling network and warming up (the first compile is slow)...")
         else:
@@ -299,7 +305,7 @@ def main(argv=None) -> int:
             # share that single compiled module across all client sessions.
             artifacts["network"] = warmup_session.network
         # warmup() prints its own timing/completion line.
-        warmup_session.warmup()
+        gpu_executor.submit(warmup_session.warmup).result()
         warmup_session.executor.shutdown(wait=False)
         del warmup_session
 
@@ -325,6 +331,7 @@ def main(argv=None) -> int:
         verbose=args.verbose,
         api_key=api_key,
         enable_undo=not args.no_undo,
+        gpu_executor=gpu_executor,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0

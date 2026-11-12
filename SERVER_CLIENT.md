@@ -103,7 +103,7 @@ nninteractive-server \
 | `--torch-n-threads` | CPU threads for torch. Default: `8`. |
 | `--no-torch-compile` | Disable compiling the network with `torch.compile` (compile is **on by default**). With compile enabled the server runs a dummy warmup forward pass at startup to trigger the (slow) one-time compilation up front, so clients never see the first-prediction delay — startup just takes longer, every prediction is faster, and the cost is amortized across the long-lived process. Pass this flag to skip compilation (faster startup, or to work around a compile/backend issue). |
 | `--no-autozoom` | Disable adaptive zoom-out (rarely needed; on by default). |
-| `--no-undo` | Disable single-level undo for all sessions server-wide (on by default). Undo snapshots each session's interaction tensor and target buffer before every interaction, costing extra RAM per session plus some background CPU per prediction; pass this to skip that overhead when clients never undo. With this set, `/capabilities` reports `supports_undo: false` and the `/undo` endpoint always reports nothing to undo. Undo is a server-startup decision — there is no per-client toggle. |
+| `--no-undo` | Disable single-level undo for all sessions server-wide (on by default). Undo saves a compressed copy of every region an interaction overwrites (interaction channels and target buffer) just before it is written, costing a few ms per prediction plus the RAM of those compressed regions until the next interaction; pass this to skip that overhead when clients never undo. With this set, `/capabilities` reports `supports_undo: false` and the `/undo` endpoint always reports nothing to undo. Undo is a server-startup decision — there is no per-client toggle. |
 | `--max-sessions` | Maximum number of concurrent client sessions. Each holds its own image, target buffer, and interaction state; the network module (and therefore its weights) is shared by reference across all sessions — exactly one copy on the GPU regardless of session count. Predictions stay GPU-serialized across sessions. Default: `1` (single-tenant — same behavior as before). |
 | `--idle-timeout-seconds` | Inactivity timeout in seconds after which a session is reaped and its slot freed. Refreshed only by real user actions (`set_image`, `add_*_interaction`, …) — *not* by heartbeats — so a connected-but-idle client is still reaped here. Default: `600` (10 min). |
 | `--liveness-timeout-seconds` | Liveness timeout in seconds: a session is reaped if the server sees *no request at all* (not even a heartbeat) from the client for this long. This is how a crashed or disconnected client's slot is reclaimed quickly. The client heartbeats automatically at half this interval. Keep it well below `--idle-timeout-seconds`. Default: `60`. |
@@ -241,9 +241,9 @@ its buffers) is shared by reference across every session. There is exactly
 one network and one copy of the weights resident on the GPU regardless of
 how many sessions are active. This gives multiple researchers on one GPU box
 independent state without duplicating the model. Sharing is safe because
-inference runs under `@torch.inference_mode()` and a global GPU lock
-serializes predict-capable endpoints, so two sessions never touch the
-network concurrently and nothing mutates it after startup.
+inference runs under `@torch.inference_mode()` and all predict-capable
+endpoints run their GPU work on one dedicated GPU thread, so two sessions never
+touch the network concurrently and nothing mutates it after startup.
 
 ### How a client gets a session
 
@@ -265,10 +265,16 @@ never see the lease token** — it's a private implementation detail.
 
 Two clients each calling `add_point_interaction(..., run_prediction=True)` at the
 same moment will see one of the two predictions wait briefly for the other to
-finish. This is by design — there is only one GPU. Non-prediction calls
-(`set_image`, `set_target_buffer`, `reset_interactions`, `add_*_interaction(...,
-run_prediction=False)`) do not contend on this lock and run concurrently across
-sessions.
+finish. This is by design — there is only one GPU. Calls that don't go through
+the GPU thread (`set_image`, `set_target_buffer`, `reset_interactions`, `undo`)
+run concurrently across sessions. `add_*_interaction(..., run_prediction=False)`
+still queues on the GPU thread, but it is quick because no prediction runs.
+
+That thread is also where the startup warmup runs. cuDNN keeps its benchmark
+(autotuning) cache per thread, so running every forward pass on the same
+long-lived thread means the warmup's autotuning is reused by all predictions
+instead of being paid again (~1 s) whenever a request lands on a new worker
+thread.
 
 If predictions feel slow under concurrent load, the answer is more GPUs (run one
 `nninteractive-server` per GPU on different ports), not raising `--max-sessions`.
